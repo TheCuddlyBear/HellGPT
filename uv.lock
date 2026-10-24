@@ -777,6 +777,7 @@ version = "0.1.0"
 source = { editable = "." }
 dependencies = [
     { name = "datasets" },
+    { name = "huggingface-hub" },
     { name = "requests" },
     { name = "safetensors" },
     { name = "tokenizers" },
@@ -787,6 +788,7 @@ dependencies = [
 [package.metadata]
 requires-dist = [
     { name = "datasets", specifier = ">=2.19.0" },
+    { name = "huggingface-hub", specifier = ">=2.3.0" },
     { name = "requests", specifier = ">=2.31.0" },
     { name = "safetensors", specifier = ">=0.4.3" },
     { name = "tokenizers", specifier = ">=0.19.0" },

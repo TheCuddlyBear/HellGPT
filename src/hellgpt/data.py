@@ -1,10 +1,8 @@
 import json
 import re
-import time
 import random
 from pathlib import Path
 from datetime import datetime
-import requests
 import os
 from huggingface_hub import hf_hub_download
 
@@ -183,85 +181,46 @@ class DiscordDataProcessor:
         return tagged_pairs
 
 
-def scrape_subreddit_pairs(
-    subreddit: str, lang_tag: str, processor: DiscordDataProcessor, max_posts: int = 20
-) -> list[tuple[str, str, str]]:
-    headers = {"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) BingiGPTTrainer/1.0"}
-    extracted = []
+# In data.py: Remove `import time` and `import requests`, and replace
+# `scrape_subreddit_pairs` + `load_external_bilingual_conversations` with:
 
-    for sort in ["hot", "top"]:
-        url = f"https://www.reddit.com/r/{subreddit}/{sort}.json?limit={max_posts}&t=month"
-        try:
-            resp = requests.get(url, headers=headers, timeout=10)
-            if resp.status_code != 200:
-                continue
-            posts = resp.json().get("data", {}).get("children", [])
-        except Exception:
-            continue
-
-        for post in posts[:20]:
-            permalink = post.get("data", {}).get("permalink")
-            post_title = processor.clean_text(post.get("data", {}).get("title", ""))
-            if not permalink:
-                continue
-            try:
-                c_resp = requests.get(
-                    f"https://www.reddit.com{permalink}.json?limit=50", headers=headers, timeout=10
-                )
-                if c_resp.status_code != 200:
-                    continue
-                c_data = c_resp.json()
-                if len(c_data) < 2:
-                    continue
-                comments = c_data[1].get("data", {}).get("children", [])
-
-                for c in comments:
-                    c_body = c.get("data", {}).get("body", "")
-                    if not c_body or c_body in ("[deleted]", "[removed]"):
-                        continue
-                    clean_parent = processor.clean_text(c_body)
-
-                    if 2 <= len(post_title.split()) <= 22 and 3 <= len(clean_parent.split()) <= 28:
-                        extracted.append((post_title, clean_parent, lang_tag))
-
-                    replies = c.get("data", {}).get("replies")
-                    if isinstance(replies, dict):
-                        for r in replies.get("data", {}).get("children", []):
-                            r_body = r.get("data", {}).get("body", "")
-                            if not r_body or r_body in ("[deleted]", "[removed]"):
-                                continue
-                            clean_reply = processor.clean_text(r_body)
-                            if 2 <= len(clean_parent.split()) <= 25 and 3 <= len(clean_reply.split()) <= 28:
-                                extracted.append((clean_parent, clean_reply, lang_tag))
-                time.sleep(0.3)
-            except Exception:
-                continue
-    return extracted
+def _extract_short_turn(text: str, processor: DiscordDataProcessor, max_words: int = 32) -> str:
+    """Extracts the first 1-2 sentences and caps word length rather than discarding the turn."""
+    if not text:
+        return ""
+    cleaned = processor.clean_text(text)
+    sentences = [s.strip() for s in re.split(r"(?<=[.!?])\s+|\n+", cleaned) if s.strip()]
+    if not sentences:
+        return ""
+    out = sentences[0]
+    if len(out.split()) < 8 and len(sentences) > 1:
+        out = f"{out} {sentences[1]}"
+    words = out.split()
+    if len(words) > max_words:
+        out = " ".join(words[:max_words])
+    return out
 
 
 def load_external_bilingual_conversations(
-    processor: DiscordDataProcessor, target_per_lang: int = 18000
+    processor: DiscordDataProcessor, target_per_lang: int = 40000
 ) -> list[tuple[str, str, str]]:
-    external = []
-    nl_subs = ["ik_ihe", "thenetherlands", "Nederland", "cirkeltrek"]
-    en_subs = ["CasualConversation", "gaming", "memes", "AskReddit"]
-
-    print("Scraping Dutch & English Reddit threads...")
-    for sub in nl_subs:
-        pairs_sub = scrape_subreddit_pairs(sub, "<|nl|>", processor, max_posts=15)
-        external.extend(pairs_sub)
-        print(f"  r/{sub}: +{len(pairs_sub)} pairs")
-
-    for sub in en_subs:
-        pairs_sub = scrape_subreddit_pairs(sub, "<|en|>", processor, max_posts=15)
-        external.extend(pairs_sub)
-        print(f"  r/{sub}: +{len(pairs_sub)} pairs")
-
     from datasets import load_dataset
 
-    print("Loading supplementary Dutch & English dialogue pairs from Hugging Face...")
+    nl_pairs = []
+    en_pairs = []
+
+    def is_good_pair(trig: str, take: str) -> bool:
+        return (
+            2 <= len(trig.split()) <= 32
+            and 3 <= len(take.split()) <= 36
+            and len(take) >= 12
+        )
+
+    print("Loading bilingual dialogue & knowledge pairs from Hugging Face (No OAuth)...")
+
+    # 1. OpenAssistant 2 (Cap EN at 50% of target so SmolTalk also gets loaded)
     try:
-        oasst = load_dataset("OpenAssistant/oasst1", split="train")
+        oasst = load_dataset("OpenAssistant/oasst2", split="train")
         msg_map, children_map = {}, {}
         for row in oasst:
             if row["lang"] in ("nl", "en") and not row.get("deleted", False):
@@ -270,54 +229,94 @@ def load_external_bilingual_conversations(
                 if pid:
                     children_map.setdefault(pid, []).append(mid)
 
+        en_cap = target_per_lang // 2
         for pid, c_ids in children_map.items():
             if pid in msg_map:
                 p_text, p_lang = msg_map[pid]
-                p_short = processor.clean_text(re.split(r"[.!?\n]+", p_text)[0])
+                p_short = _extract_short_turn(p_text, processor)
                 for cid in c_ids:
                     c_text, c_lang = msg_map[cid]
-                    c_short = processor.clean_text(re.split(r"[.!?\n]+", c_text)[0])
-                    if p_lang == c_lang and 2 <= len(p_short.split()) <= 25 and 3 <= len(c_short.split()) <= 28:
-                        external.append((p_short, c_short, p_lang))
+                    c_short = _extract_short_turn(c_text, processor)
+                    if p_lang == c_lang and is_good_pair(p_short, c_short):
+                        if p_lang == "<|nl|>":
+                            nl_pairs.append((p_short, c_short, "<|nl|>"))
+                        elif len(en_pairs) < en_cap:
+                            en_pairs.append((p_short, c_short, "<|en|>"))
+        print(f"  + OpenAssistant2: {len(nl_pairs)} NL, {len(en_pairs)} EN")
     except Exception as e:
-        print(f"OASST skip note: {e}")
+        print(f"  ! OASST2 skip: {e}")
 
+    # 2. Dutch: UltraFeedback Dutch (Uses split='train_prefs' and 'chosen' message list)
     try:
-        nl_ds = load_dataset("BramVanroy/ultra_feedback_dutch", split="train_sft", streaming=True)
-        nl_count = 0
-        for row in nl_ds:
-            msgs = row.get("messages", [])
-            if len(msgs) >= 2:
-                trig = processor.clean_text(re.split(r"[.!?\n]+", msgs[0].get("content", ""))[0])
-                take = processor.clean_text(re.split(r"[.!?\n]+", msgs[1].get("content", ""))[0])
-                if 2 <= len(trig.split()) <= 24 and 3 <= len(take.split()) <= 26 and len(take) >= 15:
-                    external.append((trig, take, "<|nl|>"))
-                    nl_count += 1
-                    if nl_count >= target_per_lang:
-                        break
-    except Exception as e:
-        print(f"Dutch HF note: {e}")
-
-    try:
-        en_ds = load_dataset("roskoN/dailydialog", split="train")
-        en_count = 0
-        for row in en_ds:
-            utterances = row.get("utterances", [])
-            for i in range(len(utterances) - 1):
-                trig = processor.clean_text(utterances[i])
-                take = processor.clean_text(utterances[i + 1])
-                if 2 <= len(trig.split()) <= 24 and 3 <= len(take.split()) <= 26 and len(take) >= 15:
-                    external.append((trig, take, "<|en|>"))
-                    en_count += 1
-                    if en_count >= target_per_lang:
-                        break
-            if en_count >= target_per_lang:
+        nl_uf = load_dataset("BramVanroy/ultra_feedback_dutch", split="train_prefs", streaming=True)
+        before = len(nl_pairs)
+        for row in nl_uf:
+            if len(nl_pairs) >= int(target_per_lang * 0.55):
                 break
+            msgs = row.get("chosen") or row.get("messages") or []
+            for i in range(len(msgs) - 1):
+                if isinstance(msgs[i], dict) and isinstance(msgs[i + 1], dict):
+                    trig = _extract_short_turn(msgs[i].get("content", ""), processor)
+                    take = _extract_short_turn(msgs[i + 1].get("content", ""), processor)
+                    if is_good_pair(trig, take):
+                        nl_pairs.append((trig, take, "<|nl|>"))
+        print(f"  + UltraFeedback-NL: +{len(nl_pairs) - before} NL")
     except Exception as e:
-        print(f"English HF note: {e}")
+        print(f"  ! UltraFeedback-NL skip: {e}")
 
+    # 3. Dutch: Dolly-15k & Alpaca Dutch (Both use split='train_sft' and 'messages' list)
+    for ds_name in ["BramVanroy/dolly-15k-dutch", "BramVanroy/alpaca-cleaned-dutch"]:
+        if len(nl_pairs) >= target_per_lang:
+            break
+        try:
+            ds = load_dataset(ds_name, split="train_sft", streaming=True)
+            before = len(nl_pairs)
+            for row in ds:
+                if len(nl_pairs) >= target_per_lang:
+                    break
+                msgs = row.get("messages", [])
+                if len(msgs) >= 2:
+                    for i in range(len(msgs) - 1):
+                        trig = _extract_short_turn(msgs[i].get("content", ""), processor)
+                        take = _extract_short_turn(msgs[i + 1].get("content", ""), processor)
+                        if is_good_pair(trig, take):
+                            nl_pairs.append((trig, take, "<|nl|>"))
+                elif "instruction" in row or "prompt" in row:
+                    prompt = row.get("instruction") or row.get("prompt") or ""
+                    if row.get("input"):
+                        prompt = f"{prompt} {row['input']}"
+                    trig = _extract_short_turn(prompt, processor)
+                    take = _extract_short_turn(row.get("output") or row.get("response") or "", processor)
+                    if is_good_pair(trig, take):
+                        nl_pairs.append((trig, take, "<|nl|>"))
+            print(f"  + {ds_name}: +{len(nl_pairs) - before} NL")
+        except Exception as e:
+            print(f"  ! {ds_name} skip: {e}")
+
+    # 4. English: SmolTalk Everyday Conversations + Smol-Magpie-Ultra
+    for subset in ["everyday-conversations", "smol-magpie-ultra"]:
+        if len(en_pairs) >= target_per_lang:
+            break
+        try:
+            smol = load_dataset("HuggingFaceTB/smoltalk", subset, split="train", streaming=True)
+            before = len(en_pairs)
+            for row in smol:
+                if len(en_pairs) >= target_per_lang:
+                    break
+                msgs = row.get("messages", [])
+                for i in range(len(msgs) - 1):
+                    trig = _extract_short_turn(msgs[i].get("content", ""), processor)
+                    take = _extract_short_turn(msgs[i + 1].get("content", ""), processor)
+                    if is_good_pair(trig, take):
+                        en_pairs.append((trig, take, "<|en|>"))
+            print(f"  + SmolTalk ({subset}): +{len(en_pairs) - before} EN")
+        except Exception as e:
+            print(f"  ! SmolTalk ({subset}) skip: {e}")
+
+    external = nl_pairs[:target_per_lang] + en_pairs[:target_per_lang]
     random.shuffle(external)
-    nl_tot = sum(1 for _, _, l in external if l == "<|nl|>")
-    en_tot = sum(1 for _, _, l in external if l == "<|en|>")
-    print(f"Total external pairs loaded: {len(external)} (NL: {nl_tot}, EN: {en_tot})")
+    print(
+        f"Total external pairs loaded: {len(external)} "
+        f"(NL: {len(nl_pairs[:target_per_lang])}, EN: {len(en_pairs[:target_per_lang])})"
+    )
     return external

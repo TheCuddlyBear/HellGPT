@@ -23,8 +23,8 @@ def train_server_tokenizer(
         min_frequency=2,
     )
 
-    sample_ext = external_pairs[: len(discord_pairs) // 2] if external_pairs else []
-    corpus = [f"{p[0]} {p[1]}" for p in (discord_pairs * 2 + sample_ext)]
+    sample_ext = external_pairs[: len(discord_pairs) * 3] if external_pairs else []
+    corpus = [f"{p[0]} {p[1]}" for p in (discord_pairs * 3 + sample_ext)]
 
     tokenizer.train_from_iterator(corpus, trainer=trainer)
     tokenizer.save(str(save_path))

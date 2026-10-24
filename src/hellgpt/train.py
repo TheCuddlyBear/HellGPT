@@ -93,7 +93,19 @@ def run_two_stage_training(
     # ========================================================================
     # STAGE 2: Discord Server Fine-Tuning
     # ========================================================================
-    print(f"\n=== STAGE 2: Fine-tuning Exclusively on Discord ({len(discord_train_ds)} samples) ===")
+    print(f"\n=== STAGE 2: Fine-tuning on Discord + 15% Replay Buffer ===")
+    if external_dataset is not None and len(external_dataset) > 0:
+        replay_size = min(len(external_dataset), int(0.18 * len(discord_train_ds)))
+        replay_subset, _ = random_split(
+            external_dataset,
+            [replay_size, len(external_dataset) - replay_size],
+            generator=torch.Generator().manual_seed(42),
+        )
+        stage2_ds = ConcatDataset([discord_train_ds, replay_subset])
+    else:
+        stage2_ds = discord_train_ds
+
+    stage2_loader = DataLoader(stage2_ds, batch_size=batch_size, shuffle=True, pin_memory=(device == "cuda"))
     s2_groups = [
         {"params": decay_params, "weight_decay": 0.1, "lr": stage2_lr},
         {"params": nodecay_params, "weight_decay": 0.0, "lr": stage2_lr},
