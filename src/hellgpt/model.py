@@ -1,3 +1,4 @@
+import math
 from pathlib import Path
 import torch
 import torch.nn as nn
@@ -7,27 +8,68 @@ from transformers import PretrainedConfig, PreTrainedModel
 from transformers.modeling_outputs import CausalLMOutput
 
 
+class RMSNorm(nn.Module):
+    def __init__(self, dim: int, eps: float = 1e-6):
+        super().__init__()
+        self.eps = eps
+        self.weight = nn.Parameter(torch.ones(dim))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        norm_x = x.float().pow(2).mean(-1, keepdim=True)
+        x_normed = x * torch.rsqrt(norm_x + self.eps).type_as(x)
+        return x_normed * self.weight
+
+
+def precompute_rope_cache(
+    seq_len: int, head_dim: int, base: float = 10000.0
+) -> tuple[torch.Tensor, torch.Tensor]:
+    theta = 1.0 / (base ** (torch.arange(0, head_dim, 2).float() / head_dim))
+    seq_idx = torch.arange(seq_len).float()
+    freqs = torch.outer(seq_idx, theta)
+    return torch.cos(freqs), torch.sin(freqs)
+
+
+def apply_rope(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
+    # x: (B, n_heads, T, head_dim)
+    T = x.size(2)
+    cos = cos[:T].unsqueeze(0).unsqueeze(0).type_as(x)  # (1, 1, T, head_dim // 2)
+    sin = sin[:T].unsqueeze(0).unsqueeze(0).type_as(x)
+    x1, x2 = x[..., ::2], x[..., 1::2]
+    out = torch.stack([x1 * cos - x2 * sin, x1 * sin + x2 * cos], dim=-1)
+    return out.flatten(-2)
+
+
 class CausalSelfAttention(nn.Module):
     def __init__(self, d_model: int, n_heads: int, dropout: float):
         super().__init__()
         assert d_model % n_heads == 0
         self.n_heads = n_heads
         self.head_dim = d_model // n_heads
+        assert self.head_dim % 2 == 0, "head_dim must be even for RoPE"
+
         self.qkv = nn.Linear(d_model, 3 * d_model, bias=False)
+        self.q_norm = RMSNorm(self.head_dim)
+        self.k_norm = RMSNorm(self.head_dim)
         self.proj = nn.Linear(d_model, d_model, bias=False)
         self.dropout = dropout
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self, x: torch.Tensor, rope_cos: torch.Tensor, rope_sin: torch.Tensor
+    ) -> torch.Tensor:
         B, T, C = x.size()
-        qkv = self.qkv(x)
-        q, k, v = qkv.split(C, dim=2)
+        q, k, v = self.qkv(x).split(C, dim=2)
 
-        q = q.view(B, T, self.n_heads, self.head_dim).transpose(1, 2)
-        k = k.view(B, T, self.n_heads, self.head_dim).transpose(1, 2)
+        q = self.q_norm(q.view(B, T, self.n_heads, self.head_dim).transpose(1, 2))
+        k = self.k_norm(k.view(B, T, self.n_heads, self.head_dim).transpose(1, 2))
         v = v.view(B, T, self.n_heads, self.head_dim).transpose(1, 2)
 
+        q = apply_rope(q, rope_cos, rope_sin)
+        k = apply_rope(k, rope_cos, rope_sin)
+
         out = F.scaled_dot_product_attention(
-            q, k, v,
+            q,
+            k,
+            v,
             dropout_p=self.dropout if self.training else 0.0,
             is_causal=True,
         )
@@ -35,21 +77,33 @@ class CausalSelfAttention(nn.Module):
         return self.proj(out)
 
 
+class SwiGLUMLP(nn.Module):
+    def __init__(self, d_model: int, dropout: float):
+        super().__init__()
+        # 8/3 * d_model matches the parameter count of a standard 4 * d_model MLP
+        hidden_dim = int(8 * d_model / 3)
+        hidden_dim = (hidden_dim + 63) // 64 * 64  # Align to 64 for GPU Tensor Cores
+        self.w1 = nn.Linear(d_model, hidden_dim, bias=False)
+        self.w2 = nn.Linear(hidden_dim, d_model, bias=False)
+        self.w3 = nn.Linear(d_model, hidden_dim, bias=False)
+        self.drop = nn.Dropout(dropout)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.drop(self.w2(F.silu(self.w1(x)) * self.w3(x)))
+
+
 class TransformerBlock(nn.Module):
     def __init__(self, d_model: int, n_heads: int, dropout: float):
         super().__init__()
-        self.ln1 = nn.LayerNorm(d_model)
+        self.ln1 = RMSNorm(d_model)
         self.attn = CausalSelfAttention(d_model, n_heads, dropout)
-        self.ln2 = nn.LayerNorm(d_model)
-        self.mlp = nn.Sequential(
-            nn.Linear(d_model, 4 * d_model),
-            nn.GELU(),
-            nn.Linear(4 * d_model, d_model),
-            nn.Dropout(dropout),
-        )
+        self.ln2 = RMSNorm(d_model)
+        self.mlp = SwiGLUMLP(d_model, dropout)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = x + self.attn(self.ln1(x))
+    def forward(
+        self, x: torch.Tensor, rope_cos: torch.Tensor, rope_sin: torch.Tensor
+    ) -> torch.Tensor:
+        x = x + self.attn(self.ln1(x), rope_cos, rope_sin)
         x = x + self.mlp(self.ln2(x))
         return x
 
@@ -57,12 +111,12 @@ class TransformerBlock(nn.Module):
 class MiniDiscordGPT(nn.Module):
     def __init__(
         self,
-        vocab_size: int = 2048,
-        max_seq_len: int = 96,
-        d_model: int = 256,
-        n_layers: int = 4,
-        n_heads: int = 4,
-        dropout: float = 0.22,
+        vocab_size: int = 4096,
+        max_seq_len: int = 160,
+        d_model: int = 512,
+        n_layers: int = 6,
+        n_heads: int = 8,
+        dropout: float = 0.12,
     ):
         super().__init__()
         self.vocab_size = vocab_size
@@ -71,18 +125,28 @@ class MiniDiscordGPT(nn.Module):
         self.n_layers = n_layers
         self.n_heads = n_heads
         self.dropout = dropout
+        self.label_smoothing = 0.02
 
         self.tok_emb = nn.Embedding(vocab_size, d_model)
-        self.pos_emb = nn.Embedding(max_seq_len, d_model)
         self.drop = nn.Dropout(dropout)
+
+        cos, sin = precompute_rope_cache(max_seq_len, d_model // n_heads)
+        self.register_buffer("rope_cos", cos, persistent=False)
+        self.register_buffer("rope_sin", sin, persistent=False)
 
         self.blocks = nn.ModuleList(
             [TransformerBlock(d_model, n_heads, dropout) for _ in range(n_layers)]
         )
-        self.ln_f = nn.LayerNorm(d_model)
+        self.ln_f = RMSNorm(d_model)
         self.head = nn.Linear(d_model, vocab_size, bias=False)
 
         self.apply(self._init_weights)
+        # Depth-scaled initialization for residual projections (GPT-2 / Llama style)
+        residual_std = 0.02 / math.sqrt(2 * n_layers)
+        for block in self.blocks:
+            torch.nn.init.normal_(block.attn.proj.weight, mean=0.0, std=residual_std)
+            torch.nn.init.normal_(block.mlp.w2.weight, mean=0.0, std=residual_std)
+
         self.tok_emb.weight = self.head.weight
 
     def _init_weights(self, module: nn.Module) -> None:
@@ -92,35 +156,50 @@ class MiniDiscordGPT(nn.Module):
                 torch.nn.init.zeros_(module.bias)
         elif isinstance(module, nn.Embedding):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
-        elif isinstance(module, nn.LayerNorm):
-            torch.nn.init.zeros_(module.bias)
+        elif isinstance(module, RMSNorm):
             torch.nn.init.ones_(module.weight)
 
-    def forward(self, idx: torch.Tensor, y_full: torch.Tensor = None, y_take_only: torch.Tensor = None):
+    def forward(
+        self,
+        idx: torch.Tensor,
+        y_full: torch.Tensor = None,
+        y_take_only: torch.Tensor = None,
+        label_smoothing: float = None,
+    ):
         B, T = idx.size()
-        pos = torch.arange(0, T, dtype=torch.long, device=idx.device)
+        if (
+                T > self.rope_cos.size(0)
+                or self.rope_cos.device != idx.device
+                or torch.isnan(self.rope_cos).any()
+                or torch.isinf(self.rope_cos).any()
+        ):
+            cos, sin = precompute_rope_cache(max(T, self.max_seq_len), self.d_model // self.n_heads)
+            self.rope_cos = cos.to(idx.device)
+            self.rope_sin = sin.to(idx.device)
 
-        x = self.drop(self.tok_emb(idx) + self.pos_emb(pos))
+        x = self.drop(self.tok_emb(idx))
         for block in self.blocks:
-            x = block(x)
+            x = block(x, self.rope_cos, self.rope_sin)
         x = self.ln_f(x)
         logits = self.head(x)
 
         loss = None
+        smoothing = self.label_smoothing if label_smoothing is None else label_smoothing
+
         if y_take_only is not None and y_full is not None:
             loss_take = F.cross_entropy(
                 logits.view(-1, logits.size(-1)),
                 y_take_only.view(-1),
                 ignore_index=-100,
-                label_smoothing=0.1,
+                label_smoothing=smoothing,
             )
             loss_lm = F.cross_entropy(
                 logits.view(-1, logits.size(-1)),
                 y_full.view(-1),
                 ignore_index=-100,
-                label_smoothing=0.1,
+                label_smoothing=smoothing,
             )
-            loss = 0.7 * loss_take + 0.3 * loss_lm
+            loss = 0.85 * loss_take + 0.15 * loss_lm
         elif y_take_only is not None:
             loss = F.cross_entropy(
                 logits.view(-1, logits.size(-1)),
@@ -134,17 +213,18 @@ class MiniDiscordGPT(nn.Module):
 # HUGGING FACE TRANSFORMERS COMPATIBLE WRAPPER
 # ============================================================================
 
+
 class MiniDiscordGPTConfig(PretrainedConfig):
     model_type = "mini_discord_gpt"
 
     def __init__(
         self,
-        vocab_size: int = 2048,
-        max_seq_len: int = 96,
-        d_model: int = 256,
-        n_layers: int = 4,
-        n_heads: int = 4,
-        dropout: float = 0.22,
+        vocab_size: int = 4096,
+        max_seq_len: int = 160,
+        d_model: int = 512,
+        n_layers: int = 6,
+        n_heads: int = 8,
+        dropout: float = 0.12,
         bos_token_id: int = 1,
         eos_token_id: int = 3,
         pad_token_id: int = 0,
@@ -181,6 +261,9 @@ class HFMiniDiscordGPTForCausalLM(PreTrainedModel):
             dropout=config.dropout,
         )
         self.post_init()
+        cos, sin = precompute_rope_cache(config.max_seq_len, config.d_model // config.n_heads)
+        self.model.rope_cos = cos
+        self.model.rope_sin = sin
 
     def get_input_embeddings(self):
         return self.model.tok_emb
@@ -208,7 +291,9 @@ def export_raw_safetensors(model: MiniDiscordGPT, output_path: str | Path) -> Pa
 
     model.eval()
     state_dict = model.state_dict()
-    clean_state_dict = {k: v.contiguous().cpu() for k, v in state_dict.items() if k != "head.weight"}
+    clean_state_dict = {
+        k: v.contiguous().cpu() for k, v in state_dict.items() if k != "head.weight"
+    }
     save_file(clean_state_dict, str(output_path))
     print(f"Exported flat Safetensors to: {output_path}")
     return output_path

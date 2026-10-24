@@ -57,6 +57,7 @@ def run_two_stage_training(
     # STAGE 1: Base Bilingual Grammar Pre-Training
     # ========================================================================
     if external_dataset is not None and len(external_dataset) > 0 and stage1_epochs > 0:
+        model.label_smoothing = 0.0
         stage1_combined_ds = ConcatDataset([external_dataset, discord_train_ds])
         stage1_loader = DataLoader(stage1_combined_ds, batch_size=batch_size, shuffle=True, pin_memory=(device == "cuda"))
 
@@ -94,6 +95,7 @@ def run_two_stage_training(
     # STAGE 2: Discord Server Fine-Tuning
     # ========================================================================
     print(f"\n=== STAGE 2: Fine-tuning on Discord + 15% Replay Buffer ===")
+    model.label_smoothing = 0.03
     if external_dataset is not None and len(external_dataset) > 0:
         replay_size = min(len(external_dataset), int(0.18 * len(discord_train_ds)))
         replay_subset, _ = random_split(

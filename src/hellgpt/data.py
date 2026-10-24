@@ -1,9 +1,9 @@
 import json
-import re
-import random
-from pathlib import Path
-from datetime import datetime
 import os
+import random
+import re
+from datetime import datetime
+from pathlib import Path
 from huggingface_hub import hf_hub_download
 
 # Replace with your actual Hugging Face username/dataset name
@@ -51,10 +51,11 @@ def detect_lang(text: str) -> str:
     en_score = sum(1 for w in words if w in EN_WORDS)
     return "<|en|>" if en_score > nl_score else "<|nl|>"
 
+
 def download_default_exports(
-    data_dir: Path, 
-    repo_id: str = HF_DATASET_REPO, 
-    token: str | None = None
+    data_dir: Path,
+    repo_id: str = HF_DATASET_REPO,
+    token: str | None = None,
 ) -> list[Path]:
     """
     Downloads raw Discord JSON exports from a private Hugging Face dataset repo.
@@ -62,8 +63,6 @@ def download_default_exports(
     """
     data_dir.mkdir(parents=True, exist_ok=True)
     paths = []
-    
-    # Fallback to HF_TOKEN environment variable if not explicitly passed
     auth_token = token or os.environ.get("HF_TOKEN")
 
     for filename in DISCORD_JSON_FILES:
@@ -73,7 +72,7 @@ def download_default_exports(
             downloaded_path = hf_hub_download(
                 repo_id=repo_id,
                 filename=filename,
-                repo_type="dataset",  # Crucial: tells HF this is a dataset, not a model
+                repo_type="dataset",
                 local_dir=data_dir,
                 token=auth_token,
             )
@@ -85,10 +84,17 @@ def download_default_exports(
 
 
 class DiscordDataProcessor:
-    def __init__(self, merge_window_sec: int = 60, reply_window_sec: int = 180, min_len: int = 3):
+    def __init__(
+        self,
+        merge_window_sec: int = 60,
+        reply_window_sec: int = 180,
+        min_len: int = 3,
+        max_context_turns: int = 3,
+    ):
         self.merge_window_sec = merge_window_sec
         self.reply_window_sec = reply_window_sec
         self.min_len = min_len
+        self.max_context_turns = max_context_turns
 
     def clean_text(self, text: str) -> str:
         text = re.sub(r"https?://\S+", "", text)
@@ -131,20 +137,41 @@ class DiscordDataProcessor:
                     "author_id": m["author"]["id"],
                     "content": clean_content,
                     "timestamp": self.parse_timestamp(m["timestamp"]),
-                    "ref_id": m.get("reference", {}).get("messageId") if m.get("reference") else None,
+                    "ref_id": (
+                        m.get("reference", {}).get("messageId")
+                        if m.get("reference")
+                        else None
+                    ),
                 }
                 cleaned_msgs.append(entry)
                 msg_by_id[entry["id"]] = entry
 
-            # 1. Explicit Discord Replies
+            # 1. Explicit Discord Reply Chains (1 to max_context_turns context messages -> 1 response)
             for m in cleaned_msgs:
-                ref_id = m["ref_id"]
-                if ref_id and ref_id in msg_by_id:
-                    parent = msg_by_id[ref_id]
-                    if parent["author_id"] != m["author_id"]:
-                        pairs.append((parent["content"], m["content"]))
+                chain = [m]
+                curr = m
+                while (
+                    curr.get("ref_id")
+                    and curr["ref_id"] in msg_by_id
+                    and len(chain) < self.max_context_turns + 1
+                ):
+                    parent = msg_by_id[curr["ref_id"]]
+                    # Ensure the final response is replying to someone else
+                    if len(chain) == 1 and parent["author_id"] == curr["author_id"]:
+                        break
+                    chain.append(parent)
+                    curr = parent
 
-            # 2. Consecutive message merging & adjacent pairing
+                if len(chain) >= 2:
+                    chain.reverse()
+                    # Add direct 1-turn reply pair
+                    pairs.append((chain[-2]["content"], chain[-1]["content"]))
+                    # Also add full multi-turn reply chain if deeper than 2 messages
+                    if len(chain) > 2:
+                        context_str = " <|sep|> ".join(c["content"] for c in chain[:-1])
+                        pairs.append((context_str, chain[-1]["content"]))
+
+            # 2. Consecutive message merging by the same author
             merged = []
             for m in cleaned_msgs:
                 if (
@@ -158,19 +185,40 @@ class DiscordDataProcessor:
                 else:
                     merged.append(m.copy())
 
-            for i in range(len(merged) - 1):
-                curr_m, next_m = merged[i], merged[i + 1]
-                if (
-                    curr_m["author_id"] != next_m["author_id"]
-                    and (next_m["timestamp"] - curr_m["timestamp"]) <= self.reply_window_sec
-                ):
-                    pairs.append((curr_m["content"], next_m["content"]))
+            # 3. Sliding window over merged messages (both 1-turn and multi-turn windows)
+            for i in range(1, len(merged)):
+                curr_m = merged[i - 1]
+                next_m = merged[i]
+
+                if curr_m["author_id"] == next_m["author_id"]:
+                    continue
+                if (next_m["timestamp"] - curr_m["timestamp"]) > self.reply_window_sec:
+                    continue
+
+                # Standard 1-turn pair (A -> B)
+                pairs.append((curr_m["content"], next_m["content"]))
+
+                # Multi-turn sliding window (e.g. A <|sep|> B <|sep|> C -> D)
+                context_msgs = [curr_m["content"]]
+                for back in range(i - 2, max(-1, i - 1 - self.max_context_turns), -1):
+                    if (
+                        merged[back + 1]["timestamp"] - merged[back]["timestamp"]
+                    ) <= self.reply_window_sec:
+                        context_msgs.insert(0, merged[back]["content"])
+                    else:
+                        break
+
+                if len(context_msgs) > 1:
+                    context_str = " <|sep|> ".join(context_msgs)
+                    pairs.append((context_str, next_m["content"]))
 
         unique_pairs = list(dict.fromkeys(pairs))
         tagged_pairs = []
         for trig, take in unique_pairs:
-            if len(trig.split()) >= 2 and len(take.split()) >= 3 and len(take) >= 15:
-                trig_lang = detect_lang(trig)
+            # Check the last turn in the trigger for minimum word count & language match
+            last_turn = trig.split("<|sep|>")[-1].strip()
+            if len(last_turn.split()) >= 2 and len(take.split()) >= 3 and len(take) >= 15:
+                trig_lang = detect_lang(last_turn)
                 take_lang = detect_lang(take)
                 lang_tag = take_lang if trig_lang == take_lang else trig_lang
                 tagged_pairs.append((trig, take, lang_tag))
@@ -180,9 +228,6 @@ class DiscordDataProcessor:
         print(f"Filtered Discord pairs: {len(tagged_pairs)} (NL: {nl_cnt}, EN: {en_cnt})")
         return tagged_pairs
 
-
-# In data.py: Remove `import time` and `import requests`, and replace
-# `scrape_subreddit_pairs` + `load_external_bilingual_conversations` with:
 
 def _extract_short_turn(text: str, processor: DiscordDataProcessor, max_words: int = 32) -> str:
     """Extracts the first 1-2 sentences and caps word length rather than discarding the turn."""
@@ -201,13 +246,43 @@ def _extract_short_turn(text: str, processor: DiscordDataProcessor, max_words: i
     return out
 
 
+def _extract_conversation_windows(
+    msgs: list[dict],
+    processor: DiscordDataProcessor,
+    lang_tag: str,
+    target_list: list[tuple[str, str, str]],
+    max_cap: int,
+) -> None:
+    """Extracts both 1-turn and 2-to-3 turn context windows from a HF message list."""
+    cleaned_turns = []
+    for m in msgs:
+        if isinstance(m, dict):
+            short = _extract_short_turn(m.get("content", ""), processor)
+            if short:
+                cleaned_turns.append(short)
+
+    for i in range(1, len(cleaned_turns)):
+        if len(target_list) >= max_cap:
+            break
+        trig = cleaned_turns[i - 1]
+        take = cleaned_turns[i]
+        if 2 <= len(trig.split()) <= 32 and 3 <= len(take.split()) <= 36 and len(take) >= 12:
+            target_list.append((trig, take, lang_tag))
+
+            # If there are earlier turns in the conversation, also create a multi-turn sample
+            if i >= 2 and len(target_list) < max_cap:
+                start_idx = max(0, i - processor.max_context_turns)
+                multi_trig = " <|sep|> ".join(cleaned_turns[start_idx:i])
+                target_list.append((multi_trig, take, lang_tag))
+
+
 def load_external_bilingual_conversations(
     processor: DiscordDataProcessor, target_per_lang: int = 40000
 ) -> list[tuple[str, str, str]]:
     from datasets import load_dataset
 
-    nl_pairs = []
-    en_pairs = []
+    nl_pairs: list[tuple[str, str, str]] = []
+    en_pairs: list[tuple[str, str, str]] = []
 
     def is_good_pair(trig: str, take: str) -> bool:
         return (
@@ -218,15 +293,16 @@ def load_external_bilingual_conversations(
 
     print("Loading bilingual dialogue & knowledge pairs from Hugging Face (No OAuth)...")
 
-    # 1. OpenAssistant 2 (Cap EN at 50% of target so SmolTalk also gets loaded)
+    # 1. OpenAssistant 2 (Includes 2-turn and 3-turn tree paths)
     try:
         oasst = load_dataset("OpenAssistant/oasst2", split="train")
-        msg_map, children_map = {}, {}
+        msg_map, parent_map, children_map = {}, {}, {}
         for row in oasst:
             if row["lang"] in ("nl", "en") and not row.get("deleted", False):
                 mid, pid = row["message_id"], row["parent_id"]
                 msg_map[mid] = (row["text"], "<|nl|>" if row["lang"] == "nl" else "<|en|>")
                 if pid:
+                    parent_map[mid] = pid
                     children_map.setdefault(pid, []).append(mid)
 
         en_cap = target_per_lang // 2
@@ -234,14 +310,24 @@ def load_external_bilingual_conversations(
             if pid in msg_map:
                 p_text, p_lang = msg_map[pid]
                 p_short = _extract_short_turn(p_text, processor)
+                # Check if grandparent exists for a 2-message context chain
+                gp_id = parent_map.get(pid)
+                gp_short = (
+                    _extract_short_turn(msg_map[gp_id][0], processor)
+                    if gp_id in msg_map
+                    else None
+                )
+
                 for cid in c_ids:
                     c_text, c_lang = msg_map[cid]
                     c_short = _extract_short_turn(c_text, processor)
                     if p_lang == c_lang and is_good_pair(p_short, c_short):
-                        if p_lang == "<|nl|>":
-                            nl_pairs.append((p_short, c_short, "<|nl|>"))
-                        elif len(en_pairs) < en_cap:
-                            en_pairs.append((p_short, c_short, "<|en|>"))
+                        target = nl_pairs if p_lang == "<|nl|>" else en_pairs
+                        cap = target_per_lang if p_lang == "<|nl|>" else en_cap
+                        if len(target) < cap:
+                            target.append((p_short, c_short, p_lang))
+                            if gp_short and len(gp_short.split()) >= 2 and len(target) < cap:
+                                target.append((f"{gp_short} <|sep|> {p_short}", c_short, p_lang))
         print(f"  + OpenAssistant2: {len(nl_pairs)} NL, {len(en_pairs)} EN")
     except Exception as e:
         print(f"  ! OASST2 skip: {e}")
@@ -250,16 +336,12 @@ def load_external_bilingual_conversations(
     try:
         nl_uf = load_dataset("BramVanroy/ultra_feedback_dutch", split="train_prefs", streaming=True)
         before = len(nl_pairs)
+        nl_uf_cap = int(target_per_lang * 0.55)
         for row in nl_uf:
-            if len(nl_pairs) >= int(target_per_lang * 0.55):
+            if len(nl_pairs) >= nl_uf_cap:
                 break
             msgs = row.get("chosen") or row.get("messages") or []
-            for i in range(len(msgs) - 1):
-                if isinstance(msgs[i], dict) and isinstance(msgs[i + 1], dict):
-                    trig = _extract_short_turn(msgs[i].get("content", ""), processor)
-                    take = _extract_short_turn(msgs[i + 1].get("content", ""), processor)
-                    if is_good_pair(trig, take):
-                        nl_pairs.append((trig, take, "<|nl|>"))
+            _extract_conversation_windows(msgs, processor, "<|nl|>", nl_pairs, nl_uf_cap)
         print(f"  + UltraFeedback-NL: +{len(nl_pairs) - before} NL")
     except Exception as e:
         print(f"  ! UltraFeedback-NL skip: {e}")
@@ -276,11 +358,7 @@ def load_external_bilingual_conversations(
                     break
                 msgs = row.get("messages", [])
                 if len(msgs) >= 2:
-                    for i in range(len(msgs) - 1):
-                        trig = _extract_short_turn(msgs[i].get("content", ""), processor)
-                        take = _extract_short_turn(msgs[i + 1].get("content", ""), processor)
-                        if is_good_pair(trig, take):
-                            nl_pairs.append((trig, take, "<|nl|>"))
+                    _extract_conversation_windows(msgs, processor, "<|nl|>", nl_pairs, target_per_lang)
                 elif "instruction" in row or "prompt" in row:
                     prompt = row.get("instruction") or row.get("prompt") or ""
                     if row.get("input"):
@@ -304,11 +382,7 @@ def load_external_bilingual_conversations(
                 if len(en_pairs) >= target_per_lang:
                     break
                 msgs = row.get("messages", [])
-                for i in range(len(msgs) - 1):
-                    trig = _extract_short_turn(msgs[i].get("content", ""), processor)
-                    take = _extract_short_turn(msgs[i + 1].get("content", ""), processor)
-                    if is_good_pair(trig, take):
-                        en_pairs.append((trig, take, "<|en|>"))
+                _extract_conversation_windows(msgs, processor, "<|en|>", en_pairs, target_per_lang)
             print(f"  + SmolTalk ({subset}): +{len(en_pairs) - before} EN")
         except Exception as e:
             print(f"  ! SmolTalk ({subset}) skip: {e}")

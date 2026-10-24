@@ -57,12 +57,24 @@ class DiscordTakeDataset(Dataset):
 
         self.samples = []
         for trigger, take, lang_tag in tagged_pairs:
-            trigger_ids = tokenizer.encode(trigger).ids
+            # Encode multi-turn triggers where " <|sep|> " separates history turns
+            turns = [t.strip() for t in trigger.split("<|sep|>") if t.strip()]
+            trigger_ids = []
+            for idx_t, turn in enumerate(turns):
+                if idx_t > 0:
+                    trigger_ids.append(self.sep_id)
+                trigger_ids.extend(tokenizer.encode(turn).ids)
+
             take_ids = tokenizer.encode(take).ids
             lang_id = self.nl_id if lang_tag == "<|nl|>" else self.en_id
 
-            if len(trigger_ids) > max_len - 13 or len(take_ids) == 0:
+            if len(take_ids) == 0 or len(trigger_ids) == 0:
                 continue
+
+            # Reserve at least 40 tokens for the response; left-truncate older context if needed
+            max_trig_len = max_len - min(len(take_ids), 44) - 4
+            if len(trigger_ids) > max_trig_len:
+                trigger_ids = trigger_ids[-max_trig_len:]
 
             full_ids = [self.bos_id] + trigger_ids + [self.sep_id, lang_id] + take_ids + [self.eos_id]
             if len(full_ids) > max_len:
