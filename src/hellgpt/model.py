@@ -39,23 +39,45 @@ def apply_rope(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.T
     return out.flatten(-2)
 
 
-class CausalSelfAttention(nn.Module):
-    def __init__(self, d_model: int, n_heads: int, dropout: float):
+class DifferentialSelfAttention(nn.Module):
+    """
+    (#1) Differential Self-Attention + (#3) Value Residual Connections (v0).
+    """
+
+    def __init__(self, d_model: int, n_heads: int, dropout: float, layer_idx: int = 0):
         super().__init__()
         assert d_model % n_heads == 0
         self.n_heads = n_heads
         self.head_dim = d_model // n_heads
-        assert self.head_dim % 2 == 0, "head_dim must be even for RoPE"
+        self.sub_dim = self.head_dim // 2
+        self.layer_idx = layer_idx
+        assert self.head_dim % 4 == 0, "head_dim must be divisible by 4 for DiffAttn + RoPE"
 
         self.qkv = nn.Linear(d_model, 3 * d_model, bias=False)
         self.q_norm = RMSNorm(self.head_dim)
         self.k_norm = RMSNorm(self.head_dim)
+        self.sub_norm = RMSNorm(self.head_dim)
         self.proj = nn.Linear(d_model, d_model, bias=False)
         self.dropout = dropout
 
+        # (#3) Value Residual mixing parameter for layers > 0
+        if layer_idx > 0:
+            self.v_mix = nn.Parameter(torch.zeros(1, n_heads, 1, 1))
+
+        # (#1) Differential Attention noise-canceling lambda parameters
+        self.lambda_init = 0.8 - 0.6 * math.exp(-0.3 * layer_idx)
+        self.lambda_q1 = nn.Parameter(torch.zeros(self.n_heads, self.sub_dim))
+        self.lambda_k1 = nn.Parameter(torch.zeros(self.n_heads, self.sub_dim))
+        self.lambda_q2 = nn.Parameter(torch.zeros(self.n_heads, self.sub_dim))
+        self.lambda_k2 = nn.Parameter(torch.zeros(self.n_heads, self.sub_dim))
+
     def forward(
-        self, x: torch.Tensor, rope_cos: torch.Tensor, rope_sin: torch.Tensor
-    ) -> torch.Tensor:
+        self,
+        x: torch.Tensor,
+        rope_cos: torch.Tensor,
+        rope_sin: torch.Tensor,
+        v0: torch.Tensor = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         B, T, C = x.size()
         q, k, v = self.qkv(x).split(C, dim=2)
 
@@ -63,49 +85,91 @@ class CausalSelfAttention(nn.Module):
         k = self.k_norm(k.view(B, T, self.n_heads, self.head_dim).transpose(1, 2))
         v = v.view(B, T, self.n_heads, self.head_dim).transpose(1, 2)
 
+        # (#3) Value Residual: anchor Layer 0 values and blend into deeper layers
+        if self.layer_idx == 0 or v0 is None:
+            v0 = v
+        else:
+            alpha = torch.sigmoid(self.v_mix).type_as(v)
+            v = alpha * v + (1.0 - alpha) * v0
+
         q = apply_rope(q, rope_cos, rope_sin)
         k = apply_rope(k, rope_cos, rope_sin)
 
-        out = F.scaled_dot_product_attention(
-            q,
-            k,
-            v,
-            dropout_p=self.dropout if self.training else 0.0,
-            is_causal=True,
-        )
+        # (#1) Split Q and K into differential half-heads: (B, n_heads, T, head_dim // 2)
+        q1, q2 = q.chunk(2, dim=-1)
+        k1, k2 = k.chunk(2, dim=-1)
+
+        drop_p = self.dropout if self.training else 0.0
+        attn1 = F.scaled_dot_product_attention(q1, k1, v, dropout_p=drop_p, is_causal=True)
+        attn2 = F.scaled_dot_product_attention(q2, k2, v, dropout_p=drop_p, is_causal=True)
+
+        # Compute per-head learnable noise-canceling scalar lambda: (1, n_heads, 1, 1)
+        lam1 = torch.exp(torch.sum(self.lambda_q1 * self.lambda_k1, dim=-1).float()).type_as(x)
+        lam2 = torch.exp(torch.sum(self.lambda_q2 * self.lambda_k2, dim=-1).float()).type_as(x)
+        lam = (lam1 - lam2 + self.lambda_init).view(1, self.n_heads, 1, 1)
+
+        out = self.sub_norm(attn1 - lam * attn2) * (1.0 - self.lambda_init)
         out = out.transpose(1, 2).contiguous().view(B, T, C)
-        return self.proj(out)
+        return self.proj(out), v0
 
 
-class SwiGLUMLP(nn.Module):
+class BilingualSwiGLUMLP(nn.Module):
+    """
+    (#2) Shared Core + Soft-Routed Bilingual (NL/EN) Dual-Expert SwiGLU.
+    """
+
     def __init__(self, d_model: int, dropout: float):
         super().__init__()
-        # 8/3 * d_model matches the parameter count of a standard 4 * d_model MLP
-        hidden_dim = int(8 * d_model / 3)
-        hidden_dim = (hidden_dim + 63) // 64 * 64  # Align to 64 for GPU Tensor Cores
-        self.w1 = nn.Linear(d_model, hidden_dim, bias=False)
-        self.w2 = nn.Linear(hidden_dim, d_model, bias=False)
-        self.w3 = nn.Linear(d_model, hidden_dim, bias=False)
+        shared_dim = (int(2 * d_model) + 63) // 64 * 64
+        expert_dim = (int(2 * d_model / 3) + 63) // 64 * 64
+
+        # Shared core trunk
+        self.w1_s = nn.Linear(d_model, shared_dim, bias=False)
+        self.w3_s = nn.Linear(d_model, shared_dim, bias=False)
+        self.w2_s = nn.Linear(shared_dim, d_model, bias=False)
+
+        # Soft 2-expert router (Expert 0 & Expert 1 specialize in NL vs EN phrasing/slang)
+        self.router = nn.Linear(d_model, 2, bias=False)
+        self.w1_exp0 = nn.Linear(d_model, expert_dim, bias=False)
+        self.w3_exp0 = nn.Linear(d_model, expert_dim, bias=False)
+        self.w2_exp0 = nn.Linear(expert_dim, d_model, bias=False)
+
+        self.w1_exp1 = nn.Linear(d_model, expert_dim, bias=False)
+        self.w3_exp1 = nn.Linear(d_model, expert_dim, bias=False)
+        self.w2_exp1 = nn.Linear(expert_dim, d_model, bias=False)
+
         self.drop = nn.Dropout(dropout)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.drop(self.w2(F.silu(self.w1(x)) * self.w3(x)))
+        shared_out = self.w2_s(F.silu(self.w1_s(x)) * self.w3_s(x))
+
+        gates = F.softmax(self.router(x), dim=-1)
+        exp0_out = self.w2_exp0(F.silu(self.w1_exp0(x)) * self.w3_exp0(x))
+        exp1_out = self.w2_exp1(F.silu(self.w1_exp1(x)) * self.w3_exp1(x))
+
+        expert_out = gates[..., 0:1] * exp0_out + gates[..., 1:2] * exp1_out
+        return self.drop(shared_out + expert_out)
 
 
 class TransformerBlock(nn.Module):
-    def __init__(self, d_model: int, n_heads: int, dropout: float):
+    def __init__(self, d_model: int, n_heads: int, dropout: float, layer_idx: int = 0):
         super().__init__()
         self.ln1 = RMSNorm(d_model)
-        self.attn = CausalSelfAttention(d_model, n_heads, dropout)
+        self.attn = DifferentialSelfAttention(d_model, n_heads, dropout, layer_idx=layer_idx)
         self.ln2 = RMSNorm(d_model)
-        self.mlp = SwiGLUMLP(d_model, dropout)
+        self.mlp = BilingualSwiGLUMLP(d_model, dropout)
 
     def forward(
-        self, x: torch.Tensor, rope_cos: torch.Tensor, rope_sin: torch.Tensor
-    ) -> torch.Tensor:
-        x = x + self.attn(self.ln1(x), rope_cos, rope_sin)
+        self,
+        x: torch.Tensor,
+        rope_cos: torch.Tensor,
+        rope_sin: torch.Tensor,
+        v0: torch.Tensor = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        attn_out, v0 = self.attn(self.ln1(x), rope_cos, rope_sin, v0=v0)
+        x = x + attn_out
         x = x + self.mlp(self.ln2(x))
-        return x
+        return x, v0
 
 
 class MiniDiscordGPT(nn.Module):
@@ -135,17 +199,27 @@ class MiniDiscordGPT(nn.Module):
         self.register_buffer("rope_sin", sin, persistent=False)
 
         self.blocks = nn.ModuleList(
-            [TransformerBlock(d_model, n_heads, dropout) for _ in range(n_layers)]
+            [
+                TransformerBlock(d_model, n_heads, dropout, layer_idx=i)
+                for i in range(n_layers)
+            ]
         )
         self.ln_f = RMSNorm(d_model)
         self.head = nn.Linear(d_model, vocab_size, bias=False)
 
+        # (#5) Multi-Token Prediction (t+2 lookahead) adapter — only active during training
+        self.mtp_norm = RMSNorm(d_model)
+        self.mtp_proj = nn.Linear(d_model, d_model, bias=False)
+
         self.apply(self._init_weights)
-        # Depth-scaled initialization for residual projections (GPT-2 / Llama style)
+
+        # Depth-scaled initialization for all residual output projections
         residual_std = 0.02 / math.sqrt(2 * n_layers)
         for block in self.blocks:
             torch.nn.init.normal_(block.attn.proj.weight, mean=0.0, std=residual_std)
-            torch.nn.init.normal_(block.mlp.w2.weight, mean=0.0, std=residual_std)
+            torch.nn.init.normal_(block.mlp.w2_s.weight, mean=0.0, std=residual_std)
+            torch.nn.init.normal_(block.mlp.w2_exp0.weight, mean=0.0, std=residual_std)
+            torch.nn.init.normal_(block.mlp.w2_exp1.weight, mean=0.0, std=residual_std)
 
         self.tok_emb.weight = self.head.weight
 
@@ -168,23 +242,29 @@ class MiniDiscordGPT(nn.Module):
     ):
         B, T = idx.size()
         if (
-                T > self.rope_cos.size(0)
-                or self.rope_cos.device != idx.device
-                or torch.isnan(self.rope_cos).any()
-                or torch.isinf(self.rope_cos).any()
+            T > self.rope_cos.size(0)
+            or self.rope_cos.device != idx.device
+            or torch.isnan(self.rope_cos).any()
+            or torch.isinf(self.rope_cos).any()
         ):
-            cos, sin = precompute_rope_cache(max(T, self.max_seq_len), self.d_model // self.n_heads)
+            cos, sin = precompute_rope_cache(
+                max(T, self.max_seq_len), self.d_model // self.n_heads
+            )
             self.rope_cos = cos.to(idx.device)
             self.rope_sin = sin.to(idx.device)
 
         x = self.drop(self.tok_emb(idx))
+        v0 = None
         for block in self.blocks:
-            x = block(x, self.rope_cos, self.rope_sin)
-        x = self.ln_f(x)
-        logits = self.head(x)
+            x, v0 = block(x, self.rope_cos, self.rope_sin, v0=v0)
+
+        h = self.ln_f(x)
+        logits = self.head(h)
 
         loss = None
-        smoothing = self.label_smoothing if label_smoothing is None else label_smoothing
+        smoothing = (
+            self.label_smoothing if label_smoothing is None else label_smoothing
+        )
 
         if y_take_only is not None and y_full is not None:
             loss_take = F.cross_entropy(
@@ -199,7 +279,27 @@ class MiniDiscordGPT(nn.Module):
                 ignore_index=-100,
                 label_smoothing=smoothing,
             )
-            loss = 0.85 * loss_take + 0.15 * loss_lm
+            loss_t1 = 0.85 * loss_take + 0.15 * loss_lm
+
+            # (#5) Multi-Token Prediction (t+2 lookahead loss)
+            if T > 1:
+                mtp_hidden = self.mtp_norm(x[:, :-1, :] + F.silu(self.mtp_proj(h[:, :-1, :])))
+                mtp_logits = self.head(mtp_hidden)
+                y_take_t2 = y_take_only[:, 1:].contiguous()
+
+                if (y_take_t2 != -100).any():
+                    loss_t2 = F.cross_entropy(
+                        mtp_logits.view(-1, mtp_logits.size(-1)),
+                        y_take_t2.view(-1),
+                        ignore_index=-100,
+                        label_smoothing=smoothing,
+                    )
+                    loss = loss_t1 + 0.25 * loss_t2
+                else:
+                    loss = loss_t1
+            else:
+                loss = loss_t1
+
         elif y_take_only is not None:
             loss = F.cross_entropy(
                 logits.view(-1, logits.size(-1)),
@@ -261,7 +361,9 @@ class HFMiniDiscordGPTForCausalLM(PreTrainedModel):
             dropout=config.dropout,
         )
         self.post_init()
-        cos, sin = precompute_rope_cache(config.max_seq_len, config.d_model // config.n_heads)
+        cos, sin = precompute_rope_cache(
+            config.max_seq_len, config.d_model // config.n_heads
+        )
         self.model.rope_cos = cos
         self.model.rope_sin = sin
 
@@ -292,7 +394,9 @@ def export_raw_safetensors(model: MiniDiscordGPT, output_path: str | Path) -> Pa
     model.eval()
     state_dict = model.state_dict()
     clean_state_dict = {
-        k: v.contiguous().cpu() for k, v in state_dict.items() if k != "head.weight"
+        k: v.contiguous().cpu()
+        for k, v in state_dict.items()
+        if k != "head.weight" and not k.startswith("mtp_")
     }
     save_file(clean_state_dict, str(output_path))
     print(f"Exported flat Safetensors to: {output_path}")

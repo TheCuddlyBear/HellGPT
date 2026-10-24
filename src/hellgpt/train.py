@@ -50,8 +50,14 @@ def run_two_stage_training(
     stage2_loader = DataLoader(discord_train_ds, batch_size=batch_size, shuffle=True, pin_memory=(device == "cuda"))
     val_loader = DataLoader(discord_val_ds, batch_size=batch_size, shuffle=False, pin_memory=(device == "cuda"))
 
-    decay_params = [p for _, p in model.named_parameters() if p.dim() >= 2]
-    nodecay_params = [p for _, p in model.named_parameters() if p.dim() < 2]
+    decay_params = [
+        p for n, p in model.named_parameters()
+        if p.dim() >= 2 and not any(k in n for k in ("lambda_", "v_mix"))
+    ]
+    nodecay_params = [
+        p for n, p in model.named_parameters()
+        if p.dim() < 2 or any(k in n for k in ("lambda_", "v_mix"))
+    ]
 
     # ========================================================================
     # STAGE 1: Base Bilingual Grammar Pre-Training
