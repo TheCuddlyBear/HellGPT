@@ -1,0 +1,21 @@
+[project]
+name = "hellgpt"
+version = "0.1.0"
+description = "Bilingual Discord Take Generator (Two-Stage Mini-GPT with Safetensors & HF Export)"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "torch>=2.2.0",
+    "tokenizers>=0.19.0",
+    "transformers>=4.40.0",
+    "datasets>=2.19.0",
+    "safetensors>=0.4.3",
+    "requests>=2.31.0",
+]
+
+[project.scripts]
+hellgpt = "hellgpt.cli:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
