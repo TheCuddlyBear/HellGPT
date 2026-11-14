@@ -66,10 +66,10 @@ class DifferentialSelfAttention(nn.Module):
 
         # (#1) Differential Attention noise-canceling lambda parameters
         self.lambda_init = 0.8 - 0.6 * math.exp(-0.3 * layer_idx)
-        self.lambda_q1 = nn.Parameter(torch.zeros(self.n_heads, self.sub_dim))
-        self.lambda_k1 = nn.Parameter(torch.zeros(self.n_heads, self.sub_dim))
-        self.lambda_q2 = nn.Parameter(torch.zeros(self.n_heads, self.sub_dim))
-        self.lambda_k2 = nn.Parameter(torch.zeros(self.n_heads, self.sub_dim))
+        self.lambda_q1 = nn.Parameter(torch.empty(self.n_heads, self.sub_dim).normal_(mean=0.0, std=0.1))
+        self.lambda_k1 = nn.Parameter(torch.empty(self.n_heads, self.sub_dim).normal_(mean=0.0, std=0.1))
+        self.lambda_q2 = nn.Parameter(torch.empty(self.n_heads, self.sub_dim).normal_(mean=0.0, std=0.1))
+        self.lambda_k2 = nn.Parameter(torch.empty(self.n_heads, self.sub_dim).normal_(mean=0.0, std=0.1))
 
     def forward(
         self,
@@ -237,6 +237,11 @@ class MiniDiscordGPT(nn.Module):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
         elif isinstance(module, RMSNorm):
             torch.nn.init.ones_(module.weight)
+        elif isinstance(module, DifferentialSelfAttention):
+            for param in (module.lambda_q1, module.lambda_k1, module.lambda_q2, module.lambda_k2):
+                torch.nn.init.normal_(param, mean=0.0, std=0.1)
+            if hasattr(module, "v_mix"):
+                torch.nn.init.zeros_(module.v_mix)
 
     def forward(
         self,
