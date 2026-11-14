@@ -92,12 +92,15 @@ class DifferentialSelfAttention(nn.Module):
             alpha = torch.sigmoid(self.v_mix).type_as(v)
             v = alpha * v + (1.0 - alpha) * v0
 
-        q = apply_rope(q, rope_cos, rope_sin)
-        k = apply_rope(k, rope_cos, rope_sin)
-
         # (#1) Split Q and K into differential half-heads: (B, n_heads, T, head_dim // 2)
         q1, q2 = q.chunk(2, dim=-1)
         k1, k2 = k.chunk(2, dim=-1)
+
+        # Apply RoPE to Q and K
+        q1 = apply_rope(q1, rope_cos, rope_sin)
+        k1 = apply_rope(k1, rope_cos, rope_sin)
+        q2 = apply_rope(q2, rope_cos, rope_sin)
+        k2 = apply_rope(k2, rope_cos, rope_sin)
 
         drop_p = self.dropout if self.training else 0.0
         attn1 = F.scaled_dot_product_attention(q1, k1, v, dropout_p=drop_p, is_causal=True)
@@ -194,7 +197,9 @@ class MiniDiscordGPT(nn.Module):
         self.tok_emb = nn.Embedding(vocab_size, d_model)
         self.drop = nn.Dropout(dropout)
 
-        cos, sin = precompute_rope_cache(max_seq_len, d_model // n_heads)
+        sub_dim = (d_model // n_heads) // 2
+
+        cos, sin = precompute_rope_cache(max_seq_len, sub_dim)
         self.register_buffer("rope_cos", cos, persistent=False)
         self.register_buffer("rope_sin", sin, persistent=False)
 
@@ -247,8 +252,9 @@ class MiniDiscordGPT(nn.Module):
             or torch.isnan(self.rope_cos).any()
             or torch.isinf(self.rope_cos).any()
         ):
+            sub_dim = (self.d_model // self.n_heads) // 2
             cos, sin = precompute_rope_cache(
-                max(T, self.max_seq_len), self.d_model // self.n_heads
+                max(T, self.max_seq_len), sub_dim
             )
             self.rope_cos = cos.to(idx.device)
             self.rope_sin = sin.to(idx.device)
@@ -361,8 +367,9 @@ class HFMiniDiscordGPTForCausalLM(PreTrainedModel):
             dropout=config.dropout,
         )
         self.post_init()
+        sub_dim = (config.d_model // config.n_heads) // 2
         cos, sin = precompute_rope_cache(
-            config.max_seq_len, config.d_model // config.n_heads
+            config.max_seq_len, sub_dim
         )
         self.model.rope_cos = cos
         self.model.rope_sin = sin
