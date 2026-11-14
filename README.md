@@ -1,4 +1,4 @@
-uv run hf upload your-username/bingi-gpt ./artifacts/hf_model .
+uv run hf upload TheCuddlyBear/HellGPT-v2 ./artifacts/hf_model .
 
 uv run hellgpt train --download-defaults --export-format both --output-dir ./artifacts
 
